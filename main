@@ -1,1 +1,774 @@
-m
+import asyncio
+import random
+import textwrap
+import html
+from datetime import datetime, timedelta
+from typing import Optional
+
+import aiosqlite
+from aiogram import Bot, Dispatcher, types
+from aiogram.utils import executor
+from aiogram.types import ParseMode, InlineKeyboardButton, InlineKeyboardMarkup
+from fastapi import FastAPI, Request, Form, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse
+from starlette.middleware.sessions import SessionMiddleware
+import uvicorn
+
+# -------------------- CONFIG --------------------
+# Edit these values directly before running
+BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"  # <-- paste your bot token
+OWNER_TG_ID = 123456789                  # <-- paste your numeric Telegram ID
+ADMIN_PASSWORD = "change_me"
+START_BALANCE = 1000
+DB_PATH = "roulette.db"
+SESSION_SECRET = "change_this_secret"
+WEB_PORT = 8000
+GIF_URL = "https://media.giphy.com/media/3o7qE1YN7aBOFPRw8E/giphy.gif"
+MIN_BET = 50
+# ------------------------------------------------
+
+if BOT_TOKEN.startswith("PASTE") or not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set in CONFIG. Edit the file and set BOT_TOKEN before running.")
+
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher(bot)
+
+app = FastAPI()
+app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
+
+SPIN_ANIMATION_SECONDS = 5
+LOG_COOLDOWN_SECONDS = 10 * 60
+ROBBERY_COOLDOWN = 2 * 3600
+
+# In-memory active rounds: chat_id -> {'round_id': int, 'open': True}
+active_rounds = {}
+
+# -------------------- DB helpers --------------------
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript(
+            """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_id INTEGER UNIQUE,
+            username TEXT,
+            display_name TEXT,
+            balance INTEGER DEFAULT 0,
+            is_admin INTEGER DEFAULT 0,
+            is_owner INTEGER DEFAULT 0,
+            total_robbed INTEGER DEFAULT 0,
+            robberies_count INTEGER DEFAULT 0,
+            last_rob_at TEXT,
+            last_log_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS rounds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            status TEXT,
+            started_at TEXT,
+            result_number INTEGER,
+            result_color TEXT
+        );
+        CREATE TABLE IF NOT EXISTS bets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_id INTEGER,
+            user_id INTEGER,
+            amount INTEGER,
+            bet_type TEXT,
+            target TEXT
+        );
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            number INTEGER,
+            color TEXT,
+            ts TEXT
+        );
+        CREATE TABLE IF NOT EXISTS transfers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_user INTEGER,
+            to_user INTEGER,
+            amount INTEGER,
+            ts TEXT
+        );
+        CREATE TABLE IF NOT EXISTS rob_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            robber_id INTEGER,
+            victim_id INTEGER,
+            amount_stolen INTEGER,
+            success INTEGER,
+            ts TEXT
+        );
+        CREATE TABLE IF NOT EXISTS payouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount INTEGER,
+            ts TEXT
+        );
+        """
+        )
+        await db.commit()
+
+
+async def get_or_create_user(tg_user: types.User) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id FROM users WHERE tg_id=?", (tg_user.id,))
+        row = await cur.fetchone()
+        if row:
+            return row[0]
+        display = tg_user.full_name
+        await db.execute(
+            "INSERT OR IGNORE INTO users (tg_id, username, display_name, balance, is_owner) VALUES (?, ?, ?, ?, ?)",
+            (tg_user.id, tg_user.username or "", display, START_BALANCE, 1 if tg_user.id == OWNER_TG_ID else 0),
+        )
+        await db.commit()
+        cur = await db.execute("SELECT id FROM users WHERE tg_id=?", (tg_user.id,))
+        row = await cur.fetchone()
+        return row[0]
+
+
+async def record_log(number: int, color: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO logs (number, color, ts) VALUES (?, ?, ?)",
+            (number, color, datetime.utcnow().isoformat()),
+        )
+        await db.commit()
+
+
+async def record_payout(user_id: int, amount: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO payouts (user_id, amount, ts) VALUES (?, ?, ?)",
+            (user_id, amount, datetime.utcnow().isoformat()),
+        )
+        await db.commit()
+
+
+# -------------------- Utilities --------------------
+def get_color(number: int) -> str:
+    if number == 0:
+        return "зелёный"
+    return "красный" if number % 2 == 1 else "чёрный"
+
+
+def parse_bet_text(text: str):
+    parts = text.strip().lower().split()
+    if len(parts) < 2:
+        return None
+    try:
+        amount = int(parts[0])
+    except ValueError:
+        return None
+    target = parts[1]
+    if target in ("красное", "red"):
+        return amount, "color", "red"
+    if target in ("черное", "чёрное", "black"):
+        return amount, "color", "black"
+    if target in ("0", "зеро", "green"):
+        return amount, "number", "0"
+    if target in ("odd", "нечетное", "неч"):
+        return amount, "odd", ""
+    if target in ("even", "четное", "чет"):
+        return amount, "even", ""
+    if "-" in target:
+        try:
+            lo, hi = target.split("-", 1)
+            lo_i, hi_i = int(lo), int(hi)
+            if 0 <= lo_i <= hi_i <= 36:
+                return amount, "range", f"{lo_i}-{hi_i}"
+        except Exception:
+            return None
+    try:
+        num = int(target)
+        if 0 <= num <= 36:
+            return amount, "number", str(num)
+    except ValueError:
+        pass
+    return None
+
+
+async def find_user_by_mention_or_reply(message: types.Message) -> Optional[types.User]:
+    if message.reply_to_message:
+        return message.reply_to_message.from_user
+    entities = message.entities or []
+    for ent in entities:
+        if ent.type == "text_mention" and ent.user:
+            return ent.user
+    return None
+
+
+# -------------------- Handlers --------------------
+@dp.message_handler(content_types=types.ContentType.NEW_CHAT_MEMBERS)
+async def on_new_chat_members(message: types.Message):
+    for m in message.new_chat_members:
+        if m.id == (await bot.get_me()).id:
+            txt = textwrap.dedent(
+                f"""
+            <b>🎉 Привет! Я — рулетка‑бот 🎰</b>
+
+            <b>📜 Правила:</b>
+            • Делайте ставки в чате без слеша, например "50 красное".
+            • Минимальная ставка: <b>{MIN_BET} coins</b>.
+            • Раунд запускается, когда участвуют минимум 2 разных игрока.
+            • Чтобы запустить вращение — напишите "го".
+            • Команды: лог, уд, п, ограбить, ставки, отменить, удвоить, повторить, влд, правила.
+            """
+            )
+            await message.reply(txt)
+
+
+@dp.message_handler(lambda message: message.chat.type in ["group", "supergroup"])
+async def group_message_handler(message: types.Message):
+    text = (message.text or "").strip()
+    if not text:
+        return
+    lower = text.lower()
+    user = message.from_user
+    await get_or_create_user(user)
+
+    # Transfer
+    if lower.startswith("п "):
+        parts = text.split()
+        if len(parts) < 2:
+            await message.reply('<b>❗ Неверный формат. Пример: п 100 (reply)</b>')
+            return
+        try:
+            amount = int(parts[1])
+        except Exception:
+            await message.reply("<b>❗ Неверная сумма.</b>")
+            return
+        target_user = await find_user_by_mention_or_reply(message)
+        if not target_user:
+            await message.reply("<b>❗ Не найден получатель. Используйте reply.</b>")
+            return
+        if target_user.id == user.id:
+            await message.reply("<b>❗ Нельзя переводить себе.</b>")
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT id, balance FROM users WHERE tg_id=?", (user.id,))
+            row = await cur.fetchone()
+            if not row:
+                await message.reply("<b>❗ Вы не зарегистрированы.</b>")
+                return
+            uid, bal = row
+            if bal < amount:
+                await message.reply("<b>❗ Недостаточно средств.</b>")
+                return
+            cur = await db.execute("SELECT id FROM users WHERE tg_id=?", (target_user.id,))
+            tro = await cur.fetchone()
+            if not tro:
+                await db.execute(
+                    "INSERT INTO users (tg_id, username, display_name, balance) VALUES (?, ?, ?, ?)",
+                    (target_user.id, target_user.username or "", target_user.full_name, START_BALANCE),
+                )
+                await db.commit()
+                cur = await db.execute("SELECT id FROM users WHERE tg_id=?", (target_user.id,))
+                tro = await cur.fetchone()
+            target_id = tro[0]
+            await db.execute("UPDATE users SET balance = balance - ? WHERE id=?", (amount, uid))
+            await db.execute("UPDATE users SET balance = balance + ? WHERE id=?", (amount, target_id))
+            await db.execute(
+                "INSERT INTO transfers (from_user, to_user, amount, ts) VALUES (?, ?, ?, ?)",
+                (uid, target_id, amount, datetime.utcnow().isoformat()),
+            )
+            await db.commit()
+        await message.reply(f'<b>✅ Перевод выполнен: {amount} coins → {html.escape(target_user.full_name)}</b>')
+        return
+
+    # Robbery
+    if lower.startswith("ограбить"):
+        target_user = await find_user_by_mention_or_reply(message)
+        if not target_user:
+            await message.reply("<b>❗ Укажите цель через reply.</b>")
+            return
+        if target_user.id == OWNER_TG_ID:
+            await message.reply("<b>🚫 Нельзя ограбить владельца.</b>")
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT id, balance, last_rob_at FROM users WHERE tg_id=?", (user.id,))
+            row = await cur.fetchone()
+            if not row:
+                await message.reply("<b>❗ Вы не зарегистрированы.</b>")
+                return
+            robber_db_id, robber_balance, last_rob = row
+            if last_rob:
+                try:
+                    last_dt = datetime.fromisoformat(last_rob)
+                    if datetime.utcnow() - last_dt < timedelta(seconds=ROBBERY_COOLDOWN):
+                        await message.reply("<b>⏳ Ограбить можно раз в 2 часа.</b>")
+                        return
+                except Exception:
+                    pass
+            cur = await db.execute("SELECT id, balance, is_owner FROM users WHERE tg_id=?", (target_user.id,))
+            tro = await cur.fetchone()
+            if not tro:
+                await message.reply("<b>❗ Цель не зарегистрирована.</b>")
+                return
+            victim_id, victim_balance, is_owner = tro
+            if is_owner:
+                await message.reply("<b>🚫 Нельзя ограбить владельца.</b>")
+                return
+            chance = random.randint(1, 100)
+            success = chance <= 10
+            amount_stolen = 0
+            if success and victim_balance > 0:
+                amount_stolen = max(50, victim_balance // 10)
+                await db.execute("UPDATE users SET balance = balance - ? WHERE id=?", (amount_stolen, victim_id))
+                await db.execute(
+                    "UPDATE users SET balance = balance + ?, total_robbed = total_robbed + ?, robberies_count = robberies_count + 1, last_rob_at = ? WHERE id=?",
+                    (amount_stolen, amount_stolen, datetime.utcnow().isoformat(), robber_db_id),
+                )
+            else:
+                await db.execute("UPDATE users SET last_rob_at = ? WHERE id=?", (datetime.utcnow().isoformat(), robber_db_id))
+            await db.execute(
+                "INSERT INTO rob_history (robber_id, victim_id, amount_stolen, success, ts) VALUES (?, ?, ?, ?, ?)",
+                (robber_db_id, victim_id, amount_stolen, int(success), datetime.utcnow().isoformat()),
+            )
+            await db.commit()
+        target_mention = f'<a href="tg://user?id={target_user.id}">{html.escape(target_user.full_name)}</a>'
+        if success:
+            await message.reply(f'<b>💥 {html.escape(message.from_user.full_name)} успешно ограбил {target_mention} и забрал {amount_stolen} coins!</b>')
+        else:
+            await message.reply(f'<b>❗ Попытка ограбления {target_mention} не удалась.</b>')
+        return
+
+    # Owner info
+    if lower == "влд":
+        owner_username = "dvestl"
+        owner_name = "Талиб"
+        txt = f'<b>Владелец — {html.escape(owner_name)}</b>\n<a href="https://t.me/{owner_username}">@{owner_username}</a>'
+        await message.reply(txt)
+        return
+
+    # Betting
+    bet = parse_bet_text(text)
+    if bet:
+        amount, btype, target = bet
+        if amount < MIN_BET:
+            await message.reply(f"<b>❗ Минимальная ставка — {MIN_BET} coins. Ваша: {amount}.</b>")
+            return
+        chat_id = message.chat.id
+        if chat_id not in active_rounds:
+            async with aiosqlite.connect(DB_PATH) as db:
+                now = datetime.utcnow().isoformat()
+                cur = await db.execute("INSERT INTO rounds (chat_id, status, started_at) VALUES (?, ?, ?)", (chat_id, "open", now))
+                await db.commit()
+                round_id = cur.lastrowid
+            active_rounds[chat_id] = {"round_id": round_id, "open": True}
+            await message.reply(f'<b>🟢 Раунд открыт. Минимальная ставка <b>{MIN_BET}</b>. Нужны минимум 2 игрока для старта.</b>')
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT id, balance FROM users WHERE tg_id=?", (user.id,))
+            row = await cur.fetchone()
+            if not row:
+                await message.reply("<b>❗ Вы не зарегистрированы.</b>")
+                return
+            uid, bal = row
+            if bal < amount:
+                await message.reply("<b>❗ Недостаточно средств.</b>")
+                return
+            await db.execute("UPDATE users SET balance = balance - ? WHERE id=?", (amount, uid))
+            await db.execute(
+                "INSERT INTO bets (round_id, user_id, amount, bet_type, target) VALUES (?, ?, ?, ?, ?)",
+                (active_rounds[chat_id]["round_id"], uid, amount, btype, target),
+            )
+            await db.commit()
+            cur = await db.execute("SELECT COUNT(DISTINCT user_id) FROM bets WHERE round_id=?", (active_rounds[chat_id]["round_id"],))
+            cnt_row = await cur.fetchone()
+            players_cnt = cnt_row[0] if cnt_row else 1
+        await message.reply(f'<b>✅ Ставка принята: {amount} на {html.escape(target if target else btype)}.</b>\n<b>Игроков в раунде:</b> <b>{players_cnt}</b>')
+        return
+
+    # Cancel bets
+    if lower == "отменить":
+        chat_id = message.chat.id
+        if chat_id not in active_rounds:
+            await message.reply("<b>❗ Нет активного раунда.</b>")
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT id, amount FROM bets WHERE round_id=? AND user_id=(SELECT id FROM users WHERE tg_id=?)",
+                (active_rounds[chat_id]["round_id"], user.id),
+            )
+            rows = await cur.fetchall()
+            if not rows:
+                await message.reply("<b>ℹ️ У вас нет ставок в этом раунде.</b>")
+                return
+            total = sum(r[1] for r in rows)
+            await db.execute("DELETE FROM bets WHERE round_id=? AND user_id=(SELECT id FROM users WHERE tg_id=?)", (active_rounds[chat_id]["round_id"], user.id))
+            await db.execute("UPDATE users SET balance = balance + ? WHERE tg_id=?", (total, user.id))
+            await db.commit()
+        await message.reply(f'<b>♻️ Ставки отменены. Возвращено <b>{total} coins</b>.</b>')
+        return
+
+    # Show bets
+    if lower == "ставки":
+        chat_id = message.chat.id
+        if chat_id not in active_rounds:
+            await message.reply("<b>ℹ️ Нет активного раунда.</b>")
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT b.amount, b.bet_type, b.target FROM bets b JOIN users u ON u.id=b.user_id WHERE b.round_id=? AND u.tg_id=?",
+                (active_rounds[chat_id]["round_id"], user.id),
+            )
+            rows = await cur.fetchall()
+            if not rows:
+                await message.reply("<b>ℹ️ У вас нет ставок.</b>")
+                return
+            text_out = "<b>🎯 Ваши ставки в текущем раунде:</b>\n"
+            for amount, btype, target in rows:
+                text_out += f'{amount} на {html.escape(target if target else btype)}\n'
+            await message.reply(text_out)
+        return
+
+    # Double
+    if lower == "удвоить":
+        chat_id = message.chat.id
+        if chat_id not in active_rounds:
+            await message.reply("<b>❗ Нет активного раунда.</b>")
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT id, amount, bet_type, target FROM bets WHERE round_id=? AND user_id=(SELECT id FROM users WHERE tg_id=?) ORDER BY id DESC LIMIT 1",
+                (active_rounds[chat_id]["round_id"], user.id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                await message.reply("<b>ℹ️ Нет предыдущей ставки.</b>")
+                return
+            bid, amount, btype, target = row
+            cur = await db.execute("SELECT balance, id FROM users WHERE tg_id=?", (user.id,))
+            uro = await cur.fetchone()
+            bal, uid = uro
+            if bal < amount:
+                await message.reply("<b>❗ Недостаточно средств для удвоения.</b>")
+                return
+            await db.execute("UPDATE users SET balance = balance - ? WHERE id=?", (amount, uid))
+            await db.execute("INSERT INTO bets (round_id, user_id, amount, bet_type, target) VALUES (?, ?, ?, ?, ?)", (active_rounds[chat_id]["round_id"], uid, amount, btype, target))
+            await db.commit()
+        await message.reply("<b>✅ Ставка успешно удвоена.</b>")
+        return
+
+    # Repeat
+    if lower == "повторить":
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT amount, bet_type, target FROM bets WHERE user_id=(SELECT id FROM users WHERE tg_id=?) ORDER BY id DESC LIMIT 1", (user.id,))
+            row = await cur.fetchone()
+            if not row:
+                await message.reply("<b>ℹ️ Нет предыдущей ставки.</b>")
+                return
+            amount, btype, target = row
+        chat_id = message.chat.id
+        if chat_id not in active_rounds:
+            async with aiosqlite.connect(DB_PATH) as db:
+                now = datetime.utcnow().isoformat()
+                cur = await db.execute("INSERT INTO rounds (chat_id, status, started_at) VALUES (?, ?, ?)", (chat_id, "open", now))
+                await db.commit()
+                round_id = cur.lastrowid
+            active_rounds[chat_id] = {"round_id": round_id, "open": True}
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT id, balance FROM users WHERE tg_id=?", (user.id,))
+            row = await cur.fetchone()
+            uid, bal = row
+            if bal < amount:
+                await message.reply("<b>❗ Недостаточно средств.</b>")
+                return
+            await db.execute("UPDATE users SET balance = balance - ? WHERE id=?", (amount, uid))
+            await db.execute("INSERT INTO bets (round_id, user_id, amount, bet_type, target) VALUES (?, ?, ?, ?, ?)", (active_rounds[chat_id]["round_id"], uid, amount, btype, target))
+            await db.commit()
+        await message.reply("<b>✅ Ставка повторена.</b>")
+        return
+
+    # Log
+    if lower == "лог":
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT last_log_at FROM users WHERE tg_id=?", (user.id,))
+            row = await cur.fetchone()
+            if row and row[0]:
+                try:
+                    last = datetime.fromisoformat(row[0])
+                    if datetime.utcnow() - last < timedelta(seconds=LOG_COOLDOWN_SECONDS):
+                        remaining = int((timedelta(seconds=LOG_COOLDOWN_SECONDS) - (datetime.utcnow() - last)).total_seconds())
+                        await message.reply(f"<b>⏳ Команда лог доступна через {remaining} секунд.</b>")
+                        return
+                except Exception:
+                    pass
+            cur = await db.execute("SELECT number, color FROM logs ORDER BY id DESC LIMIT 10")
+            rows = await cur.fetchall()
+            if not rows:
+                await message.reply("<b>ℹ️ Лог пуст.</b>")
+                return
+            txt = "<b>📋 Последние 10 результатов (число — цвет):</b>\n"
+            for num, color in rows:
+                txt += f"<b>{num} — {color}</b>\n"
+            await db.execute("UPDATE users SET last_log_at = ? WHERE tg_id=?", (datetime.utcnow().isoformat(), user.id))
+            await db.commit()
+            await message.reply(txt)
+        return
+
+    # Top wealthy
+    if lower == "топ":
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT display_name, tg_id, balance FROM users ORDER BY balance DESC LIMIT 15")
+            rows = await cur.fetchall()
+            if not rows:
+                await message.reply("<b>ℹ️ Нет игроков.</b>")
+                return
+            txt = "<b>🏆 Топ 15 самых богатых:</b>\n"
+            for name, tgid, bal in rows:
+                txt += f'<a href="tg://user?id={tgid}">{html.escape(name)}</a> — {bal}\n'
+            await message.reply(txt)
+        return
+
+    # Top robbers
+    if lower in ("топграб", "топ_грабителей"):
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT display_name, tg_id, robberies_count, total_robbed FROM users ORDER BY total_robbed DESC LIMIT 10")
+            rows = await cur.fetchall()
+            txt = "<b>🕵️ Топ грабителей:</b>\n"
+            for name, tgid, cnt, tot in rows:
+                txt += f'<a href="tg://user?id={tgid}">{html.escape(name)}</a> — ограблено: {tot}, атак: {cnt}\n'
+            await message.reply(txt)
+        return
+
+    # UD - biggest payout last 24h
+    if lower == "уд":
+        since = datetime.utcnow() - timedelta(hours=24)
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT p.amount, u.display_name, u.tg_id FROM payouts p JOIN users u ON u.id=p.user_id WHERE p.ts > ? ORDER BY p.amount DESC LIMIT 1", (since.isoformat(),))
+            row = await cur.fetchone()
+            if not row:
+                await message.reply("<b>ℹ️ За последние 24 часа нет выигрышей.</b>")
+                return
+            amount, name, tgid = row
+            txt = f'<b>🔝 Самый большой выигрыш за 24 часа:</b> <a href="tg://user?id={tgid}">{html.escape(name)}</a> — {amount} coins'
+            await message.reply(txt)
+        return
+
+    # Rules/help
+    if lower in ("правила", "команды"):
+        txt = "<b>📘 Гайд — Рулетка 🎰 (команды без /)</b>\n"
+        txt += "<b>(n) красное</b>, <b>(n) черное</b>, <b>(n) 0</b>, <b>(n) 0-36</b>, <b>(n) <число></b>, <b>odd/even</b>\n"
+        txt += "<b>Отменить</b>, <b>Ставки</b>, <b>Удвоить</b>, <b>Повторить</b>, <b>п 100</b>, <b>ограбить</b>, <b>лог</b>, <b>уд</b>, <b>го</b>\n"
+        await message.reply(txt)
+        return
+
+    # Start spin 'го'
+    if lower == "го":
+        chat_id = message.chat.id
+        if chat_id not in active_rounds:
+            await message.reply("<b>❗ Нет открытого раунда — никто не сделал ставку.</b>")
+            return
+        if not active_rounds[chat_id].get("open", True):
+            await message.reply("<b>⏳ Раунд уже в процессе. Подождите...</b>")
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT COUNT(DISTINCT user_id) FROM bets WHERE round_id=?", (active_rounds[chat_id]["round_id"],))
+            cnt_row = await cur.fetchone()
+            players_cnt = cnt_row[0] if cnt_row else 0
+            if players_cnt < 2:
+                await message.reply(f"<b>❗ Для запуска раунда требуется минимум 2 игрока. Сейчас: {players_cnt}.</b>")
+                return
+        active_rounds[chat_id]["open"] = False
+        await spin_and_resolve(chat_id)
+        return
+
+
+@dp.message_handler(commands=["start"])
+async def private_start(message: types.Message):
+    me = await bot.get_me()
+    invite_url = f"https://t.me/{me.username}?startgroup=true"
+    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➕ Добавить в группу", url=invite_url))
+    txt = textwrap.dedent(f"""
+    <b>Привет! Я рулетка-бот 🎰</b>
+
+    Нажмите кнопку, чтобы добавить меня в группу. Все команды работают в группах без /
+    Минимальная ставка: <b>{MIN_BET} coins</b>.
+    """)
+    await message.reply(txt, reply_markup=kb)
+
+
+# -------------------- Spin and resolve --------------------
+async def spin_and_resolve(chat_id: int, trigger_message: Optional[types.Message] = None):
+    round_info = active_rounds.get(chat_id)
+    if not round_info:
+        return
+    round_id = round_info["round_id"]
+
+    # send animation
+    try:
+        await bot.send_animation(chat_id, animation=GIF_URL, caption="<b>🎰 Крутится рулетка...</b>")
+    except Exception:
+        msg = await bot.send_message(chat_id, "<b>🎰 Крутится рулетка...</b>")
+        for i in range(SPIN_ANIMATION_SECONDS):
+            await asyncio.sleep(1)
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=f"<b>🎰 Крутится рулетка... {i+1}/{SPIN_ANIMATION_SECONDS}</b>")
+            except Exception:
+                pass
+
+    await asyncio.sleep(SPIN_ANIMATION_SECONDS)
+
+    number = random.randint(0, 36)
+    color = get_color(number)
+
+    winners = []
+    losers = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE rounds SET status=?, result_number=?, result_color=? WHERE id=?", ("finished", number, color, round_id))
+        await db.execute("INSERT INTO logs (number, color, ts) VALUES (?, ?, ?)", (number, color, datetime.utcnow().isoformat()))
+        cur = await db.execute("SELECT b.id, b.user_id, b.amount, b.bet_type, b.target, u.tg_id, u.display_name FROM bets b JOIN users u ON u.id=b.user_id WHERE b.round_id=?", (round_id,))
+        rows = await cur.fetchall()
+        for bid, user_id, amount, bet_type, target, tg_id, display_name in rows:
+            payout = 0
+            win = False
+            bet_desc = ""
+            if bet_type == "color":
+                bet_desc = "красное" if target == "red" else "чёрное"
+                if (target == "red" and color == "красный") or (target == "black" and color == "чёрный"):
+                    payout = amount * 2
+                    win = True
+            elif bet_type == "odd":
+                bet_desc = "нечётные"
+                if number != 0 and number % 2 == 1:
+                    payout = amount * 2
+                    win = True
+            elif bet_type == "even":
+                bet_desc = "чётные"
+                if number != 0 and number % 2 == 0:
+                    payout = amount * 2
+                    win = True
+            elif bet_type == "number":
+                bet_desc = f"число {target}"
+                if int(target) == number:
+                    payout = amount * 36
+                    win = True
+            elif bet_type == "range":
+                bet_desc = f"диапазон {target}"
+                lo, hi = map(int, target.split("-"))
+                if lo <= number <= hi:
+                    span = hi - lo + 1
+                    if span > 0:
+                        payout = amount * max(2, (36 // span))
+                    else:
+                        payout = 0
+                    win = True
+            if win and payout > 0:
+                await db.execute("UPDATE users SET balance = balance + ? WHERE id=?", (payout, user_id))
+                await record_payout(user_id, payout)
+                winners.append({"tg_id": tg_id, "name": display_name, "bet": bet_desc, "stake": amount, "payout": payout})
+            else:
+                losers.append({"tg_id": tg_id, "name": display_name, "bet": bet_desc, "stake": amount})
+        await db.commit()
+
+    await bot.send_message(chat_id, f"<b>🎉 Результат: {number} — {color}</b>")
+
+    blocks = ""
+    if winners:
+        blocks += "<b>🏅 Победители:</b>\n"
+        for w in winners:
+            mention = f'<a href="tg://user?id={w["tg_id"]}">{html.escape(w["name"])}</a>'
+            net = w["payout"] - w["stake"]
+            blocks += f'<b>{mention}</b> — ставка: <b>{w["stake"]}</b> на <b>{html.escape(w["bet"])}</b> | <b>Выплата: {w["payout"]}</b> | <b>Прибыль: {net}</b>\n'
+    if losers:
+        blocks += "<b>❌ Проигравшие:</b>\n"
+        for l in losers:
+            mention = f'<a href="tg://user?id={l["tg_id"]}">{html.escape(l["name"])}</a>'
+            blocks += f'<b>{mention}</b> — ставка: <b>{l["stake"]}</b> на <b>{html.escape(l["bet"])}</b> | <b>Проигрыш: {l["stake"]}</b>\n'
+    if not blocks:
+        blocks = "<b>ℹ️ Никто не делал ставок в этом раунде.</b>"
+
+    await bot.send_message(chat_id, blocks)
+
+    try:
+        del active_rounds[chat_id]
+    except KeyError:
+        pass
+
+
+# -------------------- Simple admin panel (FastAPI) --------------------
+@app.get("/", response_class=HTMLResponse)
+async def admin_index(request: Request):
+    if not request.session.get("logged"):
+        return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id, display_name, tg_id, balance, is_admin, is_owner FROM users ORDER BY balance DESC LIMIT 200")
+        users = await cur.fetchall()
+        cur = await db.execute("SELECT tg_id, display_name FROM users WHERE is_admin=1")
+        admins = await cur.fetchall()
+    html_users = "".join([f"<tr><td>{u[0]}</td><td>{html.escape(u[1])}</td><td>{u[2]}</td><td>{u[3]}</td><td>{'Да' if u[4] else ''}</td><td>{'Да' if u[5] else ''}</td></tr>" for u in users])
+    html_admins = "".join([f"<li>{html.escape(a[1])} ({a[0]})</li>" for a in admins])
+    return HTMLResponse(f"""
+    <h1>Admin Panel</h1>
+    <h2>Admins</h2>
+    <ul>{html_admins}</ul>
+    <h2>Users</h2>
+    <table border=1>
+    <tr><th>id</th><th>name</th><th>tg_id</th><th>balance</th><th>admin</th><th>owner</th></tr>
+    {html_users}
+    </table>
+    <h2>Top-up</h2>
+    <form method="post" action="/topup">TG_ID: <input name="tg_id"/> amount: <input name="amount"/> <button>Top-up</button></form>
+    <h2>Make admin</h2>
+    <form method="post" action="/make_admin">TG_ID: <input name="tg_id"/> <button>Make admin</button></form>
+    """)
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_form(request: Request):
+    return HTMLResponse('<form method="post" action="/login">Password: <input name="password" type="password"/> <button>Login</button></form>')
+
+
+@app.post("/login")
+async def do_login(request: Request, password: str = Form(...)):
+    if password != ADMIN_PASSWORD:
+        return HTMLResponse('<p>Invalid password</p><a href="/login">Back</a>')
+    request.session["logged"] = True
+    return RedirectResponse("/", 302)
+
+
+@app.post("/topup")
+async def topup(request: Request, tg_id: int = Form(...), amount: int = Form(...)):
+    if not request.session.get("logged"):
+        raise HTTPException(status_code=403)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id FROM users WHERE tg_id=?", (tg_id,))
+        row = await cur.fetchone()
+        if not row:
+            await db.execute("INSERT INTO users (tg_id, username, display_name, balance) VALUES (?, ?, ?, ?)", (tg_id, "", f"User {tg_id}", amount))
+        else:
+            await db.execute("UPDATE users SET balance = balance + ? WHERE tg_id=?", (amount, tg_id))
+        await db.commit()
+    return RedirectResponse("/", 302)
+
+
+@app.post("/make_admin")
+async def make_admin(request: Request, tg_id: int = Form(...)):
+    if not request.session.get("logged"):
+        raise HTTPException(status_code=403)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET is_admin=1 WHERE tg_id=?", (tg_id,))
+        await db.commit()
+    return RedirectResponse("/", 302)
+
+
+# -------------------- Boot --------------------
+async def start_web():
+    config = uvicorn.Config(app, host="0.0.0.0", port=WEB_PORT, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
+# Startup tasks
+async def on_startup(_):
+    await init_db()
+    asyncio.create_task(start_web())
+
+
+# Ensure DB init
+asyncio.get_event_loop().create_task(init_db())
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.create_task(start_web())
+    executor.start_polling(dp, skip_updates=True)
