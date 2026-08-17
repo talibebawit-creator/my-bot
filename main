@@ -16,18 +16,18 @@ import uvicorn
 
 # -------------------- CONFIG --------------------
 # Edit these values directly before running
-BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"  # <-- paste your bot token
-OWNER_TG_ID = 123456789                  # <-- paste your numeric Telegram ID
-ADMIN_PASSWORD = "change_me"
-START_BALANCE = 1000
+	BOT_TOKEN = "8984189489:AAHyxXLAGJLmn0wCejhXo_pt0VWDyTRd5bY"  # <-- paste your bot token
+OWNER_TG_ID = 6101005448              # <-- paste your numeric Telegram ID
+ADMIN_PASSWORD = "77777"
+START_BALANCE = 500
 DB_PATH = "roulette.db"
 SESSION_SECRET = "change_this_secret"
 WEB_PORT = 8000
 GIF_URL = "https://media.giphy.com/media/3o7qE1YN7aBOFPRw8E/giphy.gif"
-MIN_BET = 50
+MIN_BET = 0
 # ------------------------------------------------
 
-if BOT_TOKEN.startswith("PASTE") or not BOT_TOKEN:
+if BOT_TOKEN.startswith("8984189489:AAHyxXLAGJLmn0wCejhXo_pt0VWDyTRd5bY") or not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set in CONFIG. Edit the file and set BOT_TOKEN before running.")
 
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
